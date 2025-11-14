@@ -24,7 +24,6 @@ use meshtastic::protobufs::{FromRadio, MeshPacket, PortNum};
 use meshtastic::types::{MeshChannel, NodeId};
 use meshtastic::utils::generate_rand_id;
 use meshtastic::utils::stream::{build_ble_stream, BleId};
-
 use meshtastic::Message;
 
 struct Router {
@@ -44,6 +43,7 @@ impl PacketRouter<(), Infallible> for Router {
         Ok(())
     }
     fn handle_mesh_packet(&mut self, packet: MeshPacket) -> Result<(), Infallible> {
+        println!("Mesh packet sent..");
         self.sent.push_back(packet);
         Ok(())
     }
@@ -53,18 +53,14 @@ impl PacketRouter<(), Infallible> for Router {
 }
 
 enum RecievedPacket {
-    ConnectionClosed,
     RoutingApp(Data),
     MyInfo(MyNodeInfo),
     NodeInfo(NodeId, User),
     Other,
 }
-impl From<Option<FromRadio>> for RecievedPacket {
-    fn from(from_radio: Option<FromRadio>) -> Self {
+impl From<FromRadio> for RecievedPacket {
+    fn from(from_radio: FromRadio) -> Self {
         use RecievedPacket::*;
-        let Some(from_radio) = from_radio else {
-            return ConnectionClosed;
-        };
         let Some(payload) = from_radio.payload_variant else {
             return Other;
         };
@@ -102,7 +98,7 @@ impl From<Option<FromRadio>> for RecievedPacket {
 }
 
 async fn get_ble_device() -> String {
-    println!("Scanning devices 5s...");
+    println!("Scanning devices 5s, will connect if only one device is found,...");
     let devices = meshtastic::utils::stream::available_ble_devices(Duration::from_secs(5))
         .await
         .expect("available_ble_devices failed");
@@ -153,7 +149,8 @@ async fn main() {
 
     // Get MyInfo from the first message of stream
     // -----------------------------------------------------------------------
-    let RecievedPacket::MyInfo(my_node_info) = RecievedPacket::from(packet_rx.recv().await) else {
+    let from_radio = packet_rx.recv().await.expect("BLE stream closed");
+    let RecievedPacket::MyInfo(my_node_info) = from_radio.into() else {
         panic!("Failed to receive MyInfo");
     };
 
@@ -164,18 +161,17 @@ async fn main() {
     // ensuring there is room to send outgoing messages without issues.
     // -----------------------------------------------------------------------
 
+    // Map of node names to NodeId
     let mut nodes: BTreeMap<_, _> = [(String::from("BROADCAST"), NodeId::new(u32::MAX))].into();
 
     print!("Emptying I/O buffer & getting other nodes info...");
     loop {
         tokio::select! {
             packet = packet_rx.recv() => {
+                let packet = packet.expect("BLE stream closed");
                 match RecievedPacket::from(packet).into() {
                     RecievedPacket::NodeInfo(node_id, node_info) => {
                         nodes.insert(node_info.short_name, node_id);
-                    }
-                    RecievedPacket::ConnectionClosed => {
-                        panic!("Connection closed");
                     }
                     _ => {}
                 }
@@ -190,7 +186,7 @@ async fn main() {
 
     let Some(to) = nodes.get(&to) else {
         println!("\nAvailable nodes: {:?}", nodes.keys());
-        panic!("Specified node not found");
+        panic!("Specified node '{to}' not found");
     };
 
     // Send a message
@@ -211,25 +207,23 @@ async fn main() {
 
     let sent_packet = packet_router.sent.pop_front().unwrap();
 
-    println!(" sent.");
-
     // Wait for ACK
     // -----------------------------------------------------------------------
     print!("Waiting for ACK (packet_id={})...", sent_packet.id);
     std::io::stdout().flush().unwrap();
 
     loop {
-        match packet_rx.recv().await.into() {
+        let from_radio = packet_rx.recv().await.expect("BLE stream closed");
+        match from_radio.into() {
             RecievedPacket::RoutingApp(data) => {
                 if data.portnum == PortNum::RoutingApp as i32 && data.request_id == sent_packet.id {
                     println!("got ACK");
                     break;
                 }
             }
-            RecievedPacket::ConnectionClosed => {
-                panic!("Connection closed");
-            }
             _ => {}
         }
     }
+
+    let _ = stream_api.disconnect().await.expect("Unable to disconnect");
 }
