@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::io::Write;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use meshtastic::api::StreamApi;
 use meshtastic::packet::{PacketDestination, PacketRouter};
@@ -25,11 +25,11 @@ use meshtastic::types::{MeshChannel, NodeId};
 use meshtastic::utils::generate_rand_id;
 use meshtastic::utils::stream::{build_ble_stream, BleId};
 use meshtastic::Message;
-
 struct Router {
     sent: VecDeque<MeshPacket>,
     node_id: NodeId,
 }
+
 impl Router {
     fn new(node_id: NodeId) -> Self {
         Self {
@@ -38,6 +38,7 @@ impl Router {
         }
     }
 }
+
 impl PacketRouter<(), Infallible> for Router {
     fn handle_packet_from_radio(&mut self, _packet: FromRadio) -> Result<(), Infallible> {
         Ok(())
@@ -53,11 +54,12 @@ impl PacketRouter<(), Infallible> for Router {
 }
 
 enum RecievedPacket {
-    RoutingApp(Data),
+    RoutingApp(MeshPacket, Data),
     MyInfo(MyNodeInfo),
     NodeInfo(NodeId, User),
     Other,
 }
+
 impl From<FromRadio> for RecievedPacket {
     fn from(from_radio: FromRadio) -> Self {
         use RecievedPacket::*;
@@ -74,14 +76,14 @@ impl From<FromRadio> for RecievedPacket {
                 }
             }
             PayloadVariant::Packet(recv_packet) => {
-                let Some(pv) = recv_packet.payload_variant else {
+                let Some(pv) = recv_packet.payload_variant.clone() else {
                     return Other;
                 };
                 let mesh_packet::PayloadVariant::Decoded(data) = pv else {
                     return Other;
                 };
                 match PortNum::try_from(data.portnum) {
-                    Ok(PortNum::RoutingApp) => RoutingApp(data),
+                    Ok(PortNum::RoutingApp) => RoutingApp(recv_packet, data),
                     Ok(PortNum::NodeinfoApp) => {
                         if let Ok(user) = User::decode(data.payload.as_slice()) {
                             NodeInfo(NodeId::new(recv_packet.from), user)
@@ -167,18 +169,16 @@ async fn main() {
     print!("Emptying I/O buffer & getting other nodes info...");
     loop {
         tokio::select! {
-            packet = packet_rx.recv() => {
-                let packet = packet.expect("BLE stream closed");
-                match RecievedPacket::from(packet).into() {
-                    RecievedPacket::NodeInfo(node_id, node_info) => {
-                        nodes.insert(node_info.short_name, node_id);
-                    }
-                    _ => {}
-                }
+            from_radio = packet_rx.recv() => {
                 print!(".");
+                let from_radio = from_radio.expect("BLE stream closed");
+                let RecievedPacket::NodeInfo(node_id, node_info)  =  RecievedPacket::from(from_radio).into() else {
+                    continue;
+                };
+                nodes.insert(node_info.short_name, node_id);
                 std::io::stdout().flush().unwrap();
             }
-            _ = tokio::time::sleep(Duration::from_millis(200)) => {
+            _ = tokio::time::sleep(Duration::from_millis(1000)) => {
                 break;
             }
         }
@@ -188,6 +188,8 @@ async fn main() {
         println!("\nAvailable nodes: {:?}", nodes.keys());
         panic!("Specified node '{to}' not found");
     };
+
+    println!("Destination node {}", to.id());
 
     // Send a message
     // -----------------------------------------------------------------------
@@ -212,18 +214,35 @@ async fn main() {
     print!("Waiting for ACK (packet_id={})...", sent_packet.id);
     std::io::stdout().flush().unwrap();
 
-    loop {
-        let from_radio = packet_rx.recv().await.expect("BLE stream closed");
-        match from_radio.into() {
-            RecievedPacket::RoutingApp(data) => {
-                if data.portnum == PortNum::RoutingApp as i32 && data.request_id == sent_packet.id {
-                    println!("got ACK");
-                    break;
+    let start = Instant::now();
+    let mut found = false;
+    while start.elapsed().as_secs() < 60 && !found {
+        print!(".");
+        std::io::stdout().flush().unwrap();
+        tokio::select! {
+            from_radio = packet_rx.recv()  => {
+                let from_radio = from_radio.expect("BLE stream closed");
+                let RecievedPacket::RoutingApp(mesh_packet,data)  = RecievedPacket::from(from_radio).into()  else {
+                    continue;
+                };
+                if data.portnum == PortNum::RoutingApp as i32
+                    && data.request_id == sent_packet.id
+                    && mesh_packet.from == to.id()
+                    && mesh_packet.to == my_node_info.my_node_num
+                {
+                    found = true;
                 }
             }
-            _ => {}
+            _ = tokio::time::sleep(Duration::from_millis(1000)) => {
+           }
         }
     }
 
-    let _ = stream_api.disconnect().await.expect("Unable to disconnect");
+    if found {
+        println!("got ACK in {}s", start.elapsed().as_secs());
+    } else {
+        println!("ACK timeout");
+    }
+
+    let _ = stream_api.disconnect().await;
 }
