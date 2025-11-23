@@ -13,18 +13,29 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
-use std::io::Write;
 use std::time::{Duration, Instant};
 
+use meshtastic::Message;
 use meshtastic::api::StreamApi;
 use meshtastic::packet::{PacketDestination, PacketRouter};
-use meshtastic::protobufs::from_radio::PayloadVariant;
-use meshtastic::protobufs::{mesh_packet, Data, MyNodeInfo, User};
+use meshtastic::protobufs::mesh_packet::Priority;
 use meshtastic::protobufs::{FromRadio, MeshPacket, PortNum};
+use meshtastic::protobufs::{Routing, from_radio};
+use meshtastic::protobufs::{mesh_packet, routing};
 use meshtastic::types::{MeshChannel, NodeId};
 use meshtastic::utils::generate_rand_id;
-use meshtastic::utils::stream::{build_ble_stream, BleId};
-use meshtastic::Message;
+use meshtastic::utils::stream::{BleId, build_ble_stream};
+
+const BROADCAST: u32 = 0xffffffff;
+
+macro_rules! print_flush {
+    ($($arg:tt)*) => {{
+        use std::io::{Write, stdout};
+        print!($($arg)*);
+        stdout().flush().unwrap();
+    }};
+}
+
 struct Router {
     sent: VecDeque<MeshPacket>,
     node_id: NodeId,
@@ -50,52 +61,6 @@ impl PacketRouter<(), Infallible> for Router {
     }
     fn source_node_id(&self) -> NodeId {
         self.node_id
-    }
-}
-
-enum RecievedPacket {
-    RoutingApp(MeshPacket, Data),
-    MyInfo(MyNodeInfo),
-    NodeInfo(NodeId, User),
-    Other,
-}
-
-impl From<FromRadio> for RecievedPacket {
-    fn from(from_radio: FromRadio) -> Self {
-        use RecievedPacket::*;
-        let Some(payload) = from_radio.payload_variant else {
-            return Other;
-        };
-        match payload {
-            PayloadVariant::MyInfo(my_node_info) => MyInfo(my_node_info),
-            PayloadVariant::NodeInfo(node_info) => {
-                if let Some(user) = node_info.user {
-                    NodeInfo(NodeId::new(node_info.num), user)
-                } else {
-                    Other
-                }
-            }
-            PayloadVariant::Packet(recv_packet) => {
-                let Some(pv) = recv_packet.payload_variant.clone() else {
-                    return Other;
-                };
-                let mesh_packet::PayloadVariant::Decoded(data) = pv else {
-                    return Other;
-                };
-                match PortNum::try_from(data.portnum) {
-                    Ok(PortNum::RoutingApp) => RoutingApp(recv_packet, data),
-                    Ok(PortNum::NodeinfoApp) => {
-                        if let Ok(user) = User::decode(data.payload.as_slice()) {
-                            NodeInfo(NodeId::new(recv_packet.from), user)
-                        } else {
-                            Other
-                        }
-                    }
-                    _ => Other,
-                }
-            }
-            _ => Other,
-        }
     }
 }
 
@@ -149,34 +114,39 @@ async fn main() {
         .await
         .expect("Unable to open stream api");
 
-    // Get MyInfo from the first message of stream
-    // -----------------------------------------------------------------------
-    let from_radio = packet_rx.recv().await.expect("BLE stream closed");
-    let RecievedPacket::MyInfo(my_node_info) = from_radio.into() else {
-        panic!("Failed to receive MyInfo");
-    };
-
-    println!("Got my node id {}", my_node_info.my_node_num);
-
     // Retrieve all node names by processing incoming packets.
     // This also clears the BLE connection buffer to free up space,
     // ensuring there is room to send outgoing messages without issues.
     // -----------------------------------------------------------------------
 
+    // My node
+    let mut my_node_info = None;
     // Map of node names to NodeId
-    let mut nodes: BTreeMap<_, _> = [(String::from("BROADCAST"), NodeId::new(u32::MAX))].into();
-
+    let mut nodes: BTreeMap<_, _> = BTreeMap::new();
     print!("Emptying I/O buffer & getting other nodes info...");
+
     loop {
         tokio::select! {
             from_radio = packet_rx.recv() => {
-                print!(".");
+                print_flush!(".");
+
                 let from_radio = from_radio.expect("BLE stream closed");
-                let RecievedPacket::NodeInfo(node_id, node_info)  =  RecievedPacket::from(from_radio).into() else {
-                    continue;
+                let Some(payload) = from_radio.payload_variant else {
+                    continue
                 };
-                nodes.insert(node_info.short_name, node_id);
-                std::io::stdout().flush().unwrap();
+                match payload {
+                    // Check for information about my node
+                    from_radio::PayloadVariant::MyInfo(node_info) => {
+                        my_node_info = Some(node_info)
+                    },
+                    // Check for the data in NodeDB
+                    from_radio::PayloadVariant::NodeInfo(node_info) => {
+                        if let Some(user) = node_info.user {
+                            nodes.insert(user.short_name, node_info.num);
+                        }
+                    },
+                    _=> {}
+                }
             }
             _ = tokio::time::sleep(Duration::from_millis(1000)) => {
                 break;
@@ -184,12 +154,21 @@ async fn main() {
         }
     }
 
-    let Some(to) = nodes.get(&to) else {
+    let my_node_info = my_node_info.expect("Failed to receive MyInfo");
+
+    let to = if to == "BROADCAST" {
+        BROADCAST
+    } else if let Some(to) = nodes.get(&to) {
+        *to
+    } else {
         println!("\nAvailable nodes: {:?}", nodes.keys());
         panic!("Specified node '{to}' not found");
     };
 
-    println!("Destination node {}", to.id());
+    println!(
+        "\nMy node id {}, destination node id {}",
+        my_node_info.my_node_num, to
+    );
 
     // Send a message
     // -----------------------------------------------------------------------
@@ -200,48 +179,66 @@ async fn main() {
         .send_text(
             &mut packet_router,
             msg,
-            PacketDestination::Node(*to),
+            PacketDestination::Node(NodeId::new(to)),
             true,
-            MeshChannel::default(),
+            MeshChannel::new(0).unwrap(),
         )
         .await
         .expect("Unable to send message");
 
     let sent_packet = packet_router.sent.pop_front().unwrap();
 
-    // Wait for ACK
+    // Wait for ACK (not available in Broadcast)
     // -----------------------------------------------------------------------
-    print!("Waiting for ACK (packet_id={})...", sent_packet.id);
-    std::io::stdout().flush().unwrap();
+    print_flush!("Waiting for ACK (packet_id={})...", sent_packet.id);
 
     let start = Instant::now();
-    let mut found = false;
-    while start.elapsed().as_secs() < 60 && !found {
-        print!(".");
-        std::io::stdout().flush().unwrap();
+    loop {
+        print_flush!(".");
         tokio::select! {
             from_radio = packet_rx.recv()  => {
                 let from_radio = from_radio.expect("BLE stream closed");
-                let RecievedPacket::RoutingApp(mesh_packet,data)  = RecievedPacket::from(from_radio).into()  else {
-                    continue;
-                };
-                if data.portnum == PortNum::RoutingApp as i32
-                    && data.request_id == sent_packet.id
-                    && mesh_packet.from == to.id()
+                if let Some(from_radio::PayloadVariant::Packet(mesh_packet)) = from_radio.payload_variant
+                    // Check mesh packet destination
                     && mesh_packet.to == my_node_info.my_node_num
+                    // Check request id
+                    && let Some(mesh_packet::PayloadVariant::Decoded(data)) = mesh_packet.payload_variant
+                    && data.request_id == sent_packet.id
+                    // Check that is a Routing app without error
+                    && PortNum::try_from(data.portnum) == Ok(PortNum::RoutingApp)
+                    && let Ok(Routing{ variant }) = Routing::decode(data.payload.as_slice())
+                    && let Some(routing::Variant::ErrorReason(routing_error)) = variant
                 {
-                    found = true;
+                    if routing_error != routing::Error::None as i32 {
+                        println!("Error in routing: {:?}", routing_error);
+                        break;
+                    }
+                    if mesh_packet.from == to  {
+                        // Normal ACK: if comes from the destination node
+                        println!("got ACK from destination in {}s", start.elapsed().as_secs());
+                        break;
+                    } else if mesh_packet.from == my_node_info.my_node_num  && mesh_packet.priority == Priority::Ack.into() {
+                        // Implicit ACK: my node heard another node rebroadcast my message
+                        println!("got Implicit ACK in {}s", start.elapsed().as_secs());
+                        if to == BROADCAST {
+                            // In the case of BROADCAST, this is the only packet that we will recieve.
+                            // (from documentation)
+                            // The original sender listens to see if at least one node is rebroadcasting
+                            // this packet (because naive flooding algorithm).
+                            // If it hears that the odds (given typical LoRa topologies) the odds are very
+                            // high that every node should eventually receive the message.
+                            break;
+                        }
+                    }
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(1000)) => {
-           }
+                if start.elapsed().as_secs() > 60 {
+                    println!("ACK timeout");
+                    break;
+                }
+            }
         }
-    }
-
-    if found {
-        println!("got ACK in {}s", start.elapsed().as_secs());
-    } else {
-        println!("ACK timeout");
     }
 
     let _ = stream_api.disconnect().await;
