@@ -4,10 +4,7 @@
 //! a Bluetooth Low Energy (BLE) connection and checking for its ACK.
 //!
 //! Usage:
-//!    cargo run --example send_message_ble --features="bluetooth-le tokio" -- <DESTINATION_NODE | BROADCAST> <MESSAGE> [BLE_DEVICE_NAME]
-//!
-//! If the BLE_DEVICE_NAME is not provided, the example will scan and prompt to specify a device if multiple
-//! are found.
+//!    cargo run --example send_message_ble --features="bluetooth-le tokio" -- <DESTINATION_NODE | BROADCAST> <MESSAGE> <BLE_DEVICE_NAME>
 //!
 //! if the DESTINATION_NODE is not found the example will dump all destination nodes found.
 
@@ -15,16 +12,16 @@ use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::time::{Duration, Instant};
 
-use meshtastic::Message;
 use meshtastic::api::StreamApi;
 use meshtastic::packet::{PacketDestination, PacketRouter};
 use meshtastic::protobufs::mesh_packet::Priority;
-use meshtastic::protobufs::{FromRadio, MeshPacket, PortNum};
-use meshtastic::protobufs::{Routing, from_radio};
+use meshtastic::protobufs::{from_radio, Routing};
 use meshtastic::protobufs::{mesh_packet, routing};
+use meshtastic::protobufs::{FromRadio, MeshPacket, PortNum};
 use meshtastic::types::{MeshChannel, NodeId};
 use meshtastic::utils::generate_rand_id;
-use meshtastic::utils::stream::{BleId, build_ble_stream};
+use meshtastic::utils::stream::{build_ble_stream, BleId};
+use meshtastic::Message;
 
 const BROADCAST: u32 = 0xffffffff;
 
@@ -93,10 +90,9 @@ async fn main() {
     let Some(msg) = std::env::args().nth(2) else {
         panic!("Second argument should be the message");
     };
-    let ble_device = if let Some(ble_device) = std::env::args().nth(3) {
-        ble_device
-    } else {
-        get_ble_device().await
+    let Some(ble_device) = std::env::args().nth(3) else {
+        // You can use available_ble_devices(Duration::from_secs(5)) to discover BLE devices
+        panic!("Third argument should be the BLE device name");
     };
 
     // Initialize BLE stream
@@ -198,37 +194,42 @@ async fn main() {
         tokio::select! {
             from_radio = packet_rx.recv()  => {
                 let from_radio = from_radio.expect("BLE stream closed");
-                if let Some(from_radio::PayloadVariant::Packet(mesh_packet)) = from_radio.payload_variant
-                    // Check mesh packet destination
-                    && mesh_packet.to == my_node_info.my_node_num
-                    // Check request id
-                    && let Some(mesh_packet::PayloadVariant::Decoded(data)) = mesh_packet.payload_variant
-                    && data.request_id == sent_packet.id
-                    // Check that is a Routing app without error
-                    && PortNum::try_from(data.portnum) == Ok(PortNum::RoutingApp)
-                    && let Ok(Routing{ variant }) = Routing::decode(data.payload.as_slice())
-                    && let Some(routing::Variant::ErrorReason(routing_error)) = variant
-                {
-                    if routing_error != routing::Error::None as i32 {
-                        println!("Error in routing: {:?}", routing_error);
+                let Some(from_radio::PayloadVariant::Packet(mesh_packet)) = from_radio.payload_variant else {
+                    continue;
+                };
+                let Some(mesh_packet::PayloadVariant::Decoded(data)) = mesh_packet.payload_variant else {
+                    continue;
+                };
+                if  mesh_packet.to != my_node_info.my_node_num
+                    || data.request_id != sent_packet.id
+                    || PortNum::try_from(data.portnum) != Ok(PortNum::RoutingApp) {
+                        continue;
+                }
+                let Ok(Routing{ variant }) = Routing::decode(data.payload.as_slice()) else {
+                    continue;
+                };
+                let Some(routing::Variant::ErrorReason(routing_error)) = variant else {
+                    continue;
+                };
+                if routing_error != routing::Error::None as i32 {
+                    println!("Error in routing: {:?}", routing_error);
+                    break;
+                }
+                if mesh_packet.from == to  {
+                    // Normal ACK: if comes from the destination node
+                    println!("got ACK from destination in {}s", start.elapsed().as_secs());
+                    break;
+                } else if mesh_packet.from == my_node_info.my_node_num  && mesh_packet.priority == Priority::Ack.into() {
+                    // Implicit ACK: my node heard another node rebroadcast my message
+                    println!("got Implicit ACK in {}s", start.elapsed().as_secs());
+                    if to == BROADCAST {
+                        // In the case of BROADCAST, this is the only packet that we will recieve.
+                        // (from documentation)
+                        // The original sender listens to see if at least one node is rebroadcasting
+                        // this packet (because naive flooding algorithm).
+                        // If it hears that the odds (given typical LoRa topologies) the odds are very
+                        // high that every node should eventually receive the message.
                         break;
-                    }
-                    if mesh_packet.from == to  {
-                        // Normal ACK: if comes from the destination node
-                        println!("got ACK from destination in {}s", start.elapsed().as_secs());
-                        break;
-                    } else if mesh_packet.from == my_node_info.my_node_num  && mesh_packet.priority == Priority::Ack.into() {
-                        // Implicit ACK: my node heard another node rebroadcast my message
-                        println!("got Implicit ACK in {}s", start.elapsed().as_secs());
-                        if to == BROADCAST {
-                            // In the case of BROADCAST, this is the only packet that we will recieve.
-                            // (from documentation)
-                            // The original sender listens to see if at least one node is rebroadcasting
-                            // this packet (because naive flooding algorithm).
-                            // If it hears that the odds (given typical LoRa topologies) the odds are very
-                            // high that every node should eventually receive the message.
-                            break;
-                        }
                     }
                 }
             }

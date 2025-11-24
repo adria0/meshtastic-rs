@@ -9,8 +9,8 @@ authors = ["Adam McQuilkin"]
 readme = "README.md"
 license = "GPL-3.0"
 version = "0.1.7"
-rust-version = "1.91"
-edition = "2024"
+rust-version = "1.84"
+edition = "2021"
 
 [lib]
 doctest = false
